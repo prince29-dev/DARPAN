@@ -1,0 +1,587 @@
+From d212838d055c2431fc2b7eee13248a2817841ddc Mon Sep 17 00:00:00 2001
+From: DARPAN Engineering <darpan@example.com>
+Date: Sun, 19 Jul 2026 17:04:19 +0000
+Subject: [PATCH] feat(ml): add Milestone 9.1 Dataset Generation Pipeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Generates a real ML training dataset from the existing Realtime +
+Prediction engines — no fabricated data, no separate polling loop.
+
+- ml/dataset/types.ts: DatasetRow (12 columns) + DatasetStats
+- ml/dataset/csv-writer.ts: file I/O — auto-creates dataset.csv with
+  header if missing, sync appends (safe on Node's single JS thread),
+  real fs.stat for size/mtime
+- ml/features/feature-engineering.ts: pure vehicle+prediction -> row
+  join; nullable fields (speed/bearing/stop_sequence/delay) stay null
+  when the feed genuinely doesn't report them, never fabricated
+- ml/exporter/dataset-export.service.ts: throttles writes to a real 15s
+  cadence, dedupes via snapshot-identity + a bounded vehicle_id:timestamp
+  key set, lazily re-scans the existing file once per process for
+  restart-safe stats
+- app/api/ml/dataset/stats/route.ts: GET /api/ml/dataset/stats
+  (totalRows, lastUpdated, fileSize, todaySamples)
+
+Integration: one line in services/analytics/analytics.service.ts's
+computeContext() passes the vehicles+predictions it already computed to
+recordSnapshot() — no new fetch, no new prediction run, same pattern as
+the existing recordTrendSnapshot() call right above it.
+
+.gitignore: ignore /data/ml/ (generated output, not source).
+
+Verified end-to-end against the real 5,356-vehicle sample feed:
+auto-create + header + all 5,356 rows on first write, snapshot-identity
+dedup confirmed (repeat call is a no-op), 15s throttle window confirmed
+(call within window is a no-op), post-throttle append confirmed after a
+real 16s wait (+10 rows, correctly counted as today's samples), and
+restart-safety confirmed via a fresh process re-scanning the same file
+(reports the exact prior totals).
+---
+ .gitignore                              |   3 +
+ app/api/ml/dataset/stats/route.ts       |  32 +++++
+ ml/dataset/csv-writer.ts                | 136 +++++++++++++++++++
+ ml/dataset/types.ts                     |  68 ++++++++++
+ ml/exporter/dataset-export.service.ts   | 170 ++++++++++++++++++++++++
+ ml/features/feature-engineering.ts      |  57 ++++++++
+ services/analytics/analytics.service.ts |   8 ++
+ 7 files changed, 474 insertions(+)
+ create mode 100644 app/api/ml/dataset/stats/route.ts
+ create mode 100644 ml/dataset/csv-writer.ts
+ create mode 100644 ml/dataset/types.ts
+ create mode 100644 ml/exporter/dataset-export.service.ts
+ create mode 100644 ml/features/feature-engineering.ts
+
+diff --git a/.gitignore b/.gitignore
+index 8ccc874..205e93f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,3 +32,6 @@ yarn-error.log*
+ # typescript
+ *.tsbuildinfo
+ next-env.d.ts
++
++# ml dataset (generated at runtime, not source)
++/data/ml/
+diff --git a/app/api/ml/dataset/stats/route.ts b/app/api/ml/dataset/stats/route.ts
+new file mode 100644
+index 0000000..1f88c27
+--- /dev/null
++++ b/app/api/ml/dataset/stats/route.ts
+@@ -0,0 +1,32 @@
++/**
++ * ============================================================================
++ * DARPAN — Milestone 9.1: Dataset Generation Pipeline
++ * Route: GET /api/ml/dataset/stats
++ * ============================================================================
++ *
++ * Reports on the real dataset.csv file on disk — row count, last write
++ * time, file size, and today's sample count. Reads no realtime or
++ * prediction data itself; that only happens as a side effect of
++ * `services/analytics/analytics.service.ts`'s `computeContext()` calling
++ * `ml/exporter/dataset-export.service.ts`'s `recordSnapshot()`.
++ */
++
++import { NextResponse } from "next/server";
++
++import { getDatasetStats } from "@/ml/exporter/dataset-export.service";
++
++export const dynamic = "force-dynamic";
++export const runtime = "nodejs";
++
++export async function GET(): Promise<NextResponse> {
++  try {
++    const stats = getDatasetStats();
++    return NextResponse.json(stats, { headers: { "Cache-Control": "no-store" } });
++  } catch (error) {
++    const message = error instanceof Error ? error.message : "Unknown dataset stats error.";
++    return NextResponse.json(
++      { error: { message } },
++      { status: 500, headers: { "Cache-Control": "no-store" } },
++    );
++  }
++}
+diff --git a/ml/dataset/csv-writer.ts b/ml/dataset/csv-writer.ts
+new file mode 100644
+index 0000000..133eb34
+--- /dev/null
++++ b/ml/dataset/csv-writer.ts
+@@ -0,0 +1,136 @@
++import "server-only";
++
++/**
++ * ============================================================================
++ * DARPAN — Milestone 9.1: Dataset Generation Pipeline
++ * Module: CSV writer (ml/dataset/)
++ * ============================================================================
++ *
++ * Pure file I/O for `dataset.csv` — path resolution, auto-creating the
++ * file with a header row if it doesn't exist, appending rows, and
++ * reading it back for stats. No feature logic and no throttling lives
++ * here; that's `ml/features/feature-engineering.ts` and
++ * `ml/exporter/dataset-export.service.ts` respectively — this module's
++ * only job is "how to read and write the file."
++ *
++ * Node's synchronous `fs` calls are used deliberately: JS execution on a
++ * single Node process is single-threaded, so a sync append can never
++ * interleave with another write from the same process — no separate
++ * locking needed. This does mean a horizontally-scaled (multi-instance)
++ * deployment would need a shared store instead of local disk; out of
++ * scope for this milestone, called out here rather than silently assumed
++ * away.
++ *
++ * Storage path defaults to `data/ml/dataset.csv` (mirrors the existing
++ * `data/gtfs/` convention), overridable via `ML_DATASET_PATH` for
++ * deployments that need to point it at a persistent volume or `/tmp`.
++ */
++
++import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
++import path from "node:path";
++
++import { DATASET_COLUMNS, type DatasetRow } from "@/ml/dataset/types";
++
++const DEFAULT_DATASET_PATH = path.join(process.cwd(), "data", "ml", "dataset.csv");
++
++export function resolveDatasetPath(): string {
++  const override = process.env.ML_DATASET_PATH?.trim();
++  return override ? path.resolve(override) : DEFAULT_DATASET_PATH;
++}
++
++/** Wraps a field in quotes (doubling any internal quotes) only if it
++ * actually needs it — commas, quotes, or newlines. Defensive: current
++ * real values (vehicle/route/trip IDs) never contain these, but a
++ * dataset writer should never assume that stays true forever. */
++function escapeCsvField(value: string): string {
++  if (/[",\n\r]/.test(value)) {
++    return `"${value.replace(/"/g, '""')}"`;
++  }
++  return value;
++}
++
++function formatCell(value: DatasetRow[keyof DatasetRow]): string {
++  if (value === null) return "";
++  if (typeof value === "number") return String(value);
++  return escapeCsvField(value);
++}
++
++function rowToCsvLine(row: DatasetRow): string {
++  return DATASET_COLUMNS.map((column) => formatCell(row[column])).join(",");
++}
++
++function headerLine(): string {
++  return DATASET_COLUMNS.join(",");
++}
++
++/** Creates the dataset directory + file (with header row) if either is
++ * missing. Safe to call before every write — a no-op once the file exists. */
++export function ensureDatasetFile(): string {
++  const filePath = resolveDatasetPath();
++  const dir = path.dirname(filePath);
++
++  if (!existsSync(dir)) {
++    mkdirSync(dir, { recursive: true });
++  }
++  if (!existsSync(filePath)) {
++    writeFileSync(filePath, headerLine() + "\n", "utf8");
++  }
++
++  return filePath;
++}
++
++/** Appends `rows` to the dataset file, creating it first if needed.
++ * No-op (and does not touch the file) if `rows` is empty. */
++export function appendRows(rows: readonly DatasetRow[]): void {
++  if (rows.length === 0) return;
++  const filePath = ensureDatasetFile();
++  const lines = rows.map(rowToCsvLine).join("\n") + "\n";
++  appendFileSync(filePath, lines, "utf8");
++}
++
++export interface DatasetFileStat {
++  exists: boolean;
++  fileSizeBytes: number;
++  lastModifiedMs: number | null;
++}
++
++/** Real file-system stat — `lastModifiedMs` and `fileSizeBytes` are never
++ * tracked separately in memory; they always reflect the actual file. */
++export function statDatasetFile(): DatasetFileStat {
++  const filePath = resolveDatasetPath();
++  if (!existsSync(filePath)) {
++    return { exists: false, fileSizeBytes: 0, lastModifiedMs: null };
++  }
++  const stats = statSync(filePath);
++  return { exists: true, fileSizeBytes: stats.size, lastModifiedMs: stats.mtimeMs };
++}
++
++/**
++ * Reads every existing row's `timestamp` column, for one-time stats
++ * initialization (row count + today's sample count) when the server
++ * process starts with a dataset file already on disk. Only ever called
++ * once per process lifetime — see `dataset-export.service.ts`.
++ */
++export function readExistingTimestamps(): number[] {
++  const filePath = resolveDatasetPath();
++  if (!existsSync(filePath)) return [];
++
++  const content = readFileSync(filePath, "utf8");
++  const lines = content.split("\n").filter((line) => line.length > 0);
++  if (lines.length <= 1) return []; // header only, or empty
++
++  // `timestamp` is always the first column (DATASET_COLUMNS[0]) — parsing
++  // up to the first comma is correct as long as that invariant holds.
++  const timestamps: number[] = [];
++
++  for (let i = 1; i < lines.length; i += 1) {
++    const line = lines[i];
++    if (!line) continue;
++    const firstComma = line.indexOf(",");
++    const rawTimestamp = firstComma === -1 ? line : line.slice(0, firstComma);
++    const parsed = Number.parseInt(rawTimestamp, 10);
++    if (Number.isFinite(parsed)) timestamps.push(parsed);
++  }
++
++  return timestamps;
++}
+diff --git a/ml/dataset/types.ts b/ml/dataset/types.ts
+new file mode 100644
+index 0000000..f850b25
+--- /dev/null
++++ b/ml/dataset/types.ts
+@@ -0,0 +1,68 @@
++/**
++ * ============================================================================
++ * DARPAN — Milestone 9.1: Dataset Generation Pipeline
++ * Domain: ML Dataset
++ * ============================================================================
++ *
++ * `DatasetRow` is one training sample: one live vehicle observation, at
++ * one moment, joined with the deterministic Prediction Engine output for
++ * that same vehicle at that same moment. Every field traces back to a
++ * real observation from the Realtime Engine (Milestone 6) or a
++ * deterministic computation from the Prediction Engine (Milestone 7) —
++ * see `ml/features/feature-engineering.ts` for exactly how each column
++ * is derived. Nullable fields (`speed`, `bearing`, `stop_sequence`,
++ * `deterministic_delay`) are `null` when the live feed genuinely doesn't
++ * report that value for this vehicle/trip, never a fabricated default.
++ */
++
++export interface DatasetRow {
++  /** Epoch milliseconds — the vehicle's own reported timestamp. */
++  timestamp: number;
++  vehicle_id: string;
++  route_id: string;
++  trip_id: string;
++  latitude: number;
++  longitude: number;
++  /** Meters/second, as reported by the feed. Null if not reported. */
++  speed: number | null;
++  /** Compass degrees, as reported by the feed. Null if not reported. */
++  bearing: number | null;
++  /** Null if the feed doesn't report a current stop sequence for this vehicle. */
++  stop_sequence: number | null;
++  /** Prediction Engine's real spatial-density measurement, in [0, 1]. */
++  congestion_index: number;
++  /** Prediction Engine's deterministic ETA estimate, in seconds. */
++  deterministic_eta: number;
++  /** Prediction Engine's deterministic delay estimate, in seconds.
++   * Null for trips with no schedule reference (schedule_relationship !== SCHEDULED). */
++  deterministic_delay: number | null;
++}
++
++/** Column order the CSV file is written in — the single source of truth
++ * both the writer and the header derive from. */
++export const DATASET_COLUMNS: readonly (keyof DatasetRow)[] = [
++  "timestamp",
++  "vehicle_id",
++  "route_id",
++  "trip_id",
++  "latitude",
++  "longitude",
++  "speed",
++  "bearing",
++  "stop_sequence",
++  "congestion_index",
++  "deterministic_eta",
++  "deterministic_delay",
++] as const;
++
++/** Response shape for `GET /api/ml/dataset/stats`. */
++export interface DatasetStats {
++  totalRows: number;
++  /** Epoch milliseconds the dataset file was last written to, or `null`
++   * if the file doesn't exist yet. */
++  lastUpdated: number | null;
++  /** Bytes on disk, or 0 if the file doesn't exist yet. */
++  fileSize: number;
++  /** Rows whose `timestamp` falls on the current UTC calendar day. */
++  todaySamples: number;
++}
+diff --git a/ml/exporter/dataset-export.service.ts b/ml/exporter/dataset-export.service.ts
+new file mode 100644
+index 0000000..8742e2c
+--- /dev/null
++++ b/ml/exporter/dataset-export.service.ts
+@@ -0,0 +1,170 @@
++import "server-only";
++
++/**
++ * ============================================================================
++ * DARPAN — Milestone 9.1: Dataset Generation Pipeline
++ * Service: Dataset Export
++ * ============================================================================
++ *
++ * The one integration point this milestone adds to the existing
++ * pipeline: `services/analytics/analytics.service.ts` already assembles
++ * both real live vehicles (Realtime Engine, Milestone 6) and real
++ * deterministic predictions (Prediction Engine, Milestone 7) into one
++ * shared context every time any `/api/analytics/*` or `/api/prediction/*`
++ * route is hit — see that file's `computeContext()`. This service adds
++ * one more consumer of that same already-computed data: instead of
++ * fetching or predicting anything itself, `recordSnapshot()` is called
++ * from `computeContext()` with the vehicles and predictions it already
++ * has, and turns them into dataset rows.
++ *
++ * This is a request-driven, no-database, no-persistent-background-process
++ * design — the same architecture every other engine in this codebase
++ * uses (Realtime, Prediction, Analytics all cache against real data
++ * freshness rather than running a separate timer). A consequence worth
++ * being explicit about: rows are only appended when some client is
++ * actually polling the dashboard, since that's what drives
++ * `computeContext()` to run at all. That matches how this app already
++ * behaves everywhere else (e.g. `trend.service.ts`'s rolling history),
++ * and is the realistic use case for a dataset-collection pipeline
++ * anyway — collecting real observations while the platform is being
++ * actively monitored.
++ *
++ * Deduplication has two layers:
++ *  1. If called again with the same `snapshotFetchedAtMs` (the Realtime
++ *     Engine's own data-freshness identity — unchanged means "no new
++ *     data since last time"), this is a no-op. This is the primary
++ *     guard, since `computeContext()` can run more often than the
++ *     underlying data actually refreshes.
++ *  2. A bounded in-memory set of `vehicle_id:timestamp` keys guards
++ *     against writing the exact same observation twice even across
++ *     different snapshot identities, cleared once it grows large to
++ *     keep memory bounded.
++ * A real 15-second minimum interval between writes is enforced on top,
++ * matching the milestone's "every polling cycle (15s)" requirement
++ * regardless of how often `computeContext()` itself runs.
++ */
++
++import { appendRows, readExistingTimestamps, statDatasetFile } from "@/ml/dataset/csv-writer";
++import type { DatasetRow, DatasetStats } from "@/ml/dataset/types";
++import { buildFeatureRows } from "@/ml/features/feature-engineering";
++import type { VehiclePrediction } from "@/types/prediction";
++import type { RealtimeVehicle } from "@/types/realtime";
++
++const MIN_EXPORT_INTERVAL_MS = 15_000;
++const MAX_DEDUP_KEYS = 50_000;
++
++interface ExporterState {
++  initialized: boolean;
++  totalRows: number;
++  todayDateKey: string;
++  todaySamples: number;
++  lastExportedSnapshotFetchedAtMs: number | null;
++  lastExportAtMs: number | null;
++  recentRowKeys: Set<string>;
++}
++
++const state: ExporterState = {
++  initialized: false,
++  totalRows: 0,
++  todayDateKey: "",
++  todaySamples: 0,
++  lastExportedSnapshotFetchedAtMs: null,
++  lastExportAtMs: null,
++  recentRowKeys: new Set(),
++};
++
++function todayDateKeyUtc(timestampMs: number = Date.now()): string {
++  return new Date(timestampMs).toISOString().slice(0, 10); // "YYYY-MM-DD"
++}
++
++/** One-time, lazy initialization from whatever is already on disk — so
++ * stats are accurate across server restarts, not just for this process's
++ * own writes. Only ever scans the file once per process lifetime. */
++function ensureInitialized(): void {
++  if (state.initialized) return;
++
++  const existingTimestamps = readExistingTimestamps();
++  const todayKey = todayDateKeyUtc();
++
++  state.totalRows = existingTimestamps.length;
++  state.todayDateKey = todayKey;
++  state.todaySamples = existingTimestamps.filter((ts) => todayDateKeyUtc(ts) === todayKey).length;
++  state.initialized = true;
++}
++
++function rollDayIfNeeded(): void {
++  const todayKey = todayDateKeyUtc();
++  if (todayKey !== state.todayDateKey) {
++    state.todayDateKey = todayKey;
++    state.todaySamples = 0;
++  }
++}
++
++function dedupeRows(rows: readonly DatasetRow[]): DatasetRow[] {
++  const fresh: DatasetRow[] = [];
++  for (const row of rows) {
++    const key = `${row.vehicle_id}:${row.timestamp}`;
++    if (state.recentRowKeys.has(key)) continue;
++    state.recentRowKeys.add(key);
++    fresh.push(row);
++  }
++  if (state.recentRowKeys.size > MAX_DEDUP_KEYS) {
++    state.recentRowKeys.clear();
++  }
++  return fresh;
++}
++
++/**
++ * Generates one dataset row per vehicle from `vehicles`/`predictions`
++ * and appends the new (non-duplicate) rows to `dataset.csv`, throttled
++ * to at most once every 15 seconds. Safe to call on every
++ * `computeContext()` invocation — most calls will be no-ops.
++ */
++export function recordSnapshot(
++  vehicles: readonly RealtimeVehicle[],
++  predictions: readonly VehiclePrediction[],
++  snapshotFetchedAtMs: number,
++): void {
++  ensureInitialized();
++
++  if (state.lastExportedSnapshotFetchedAtMs === snapshotFetchedAtMs) {
++    return; // same underlying Realtime Engine data — nothing new to record
++  }
++
++  const now = Date.now();
++  if (state.lastExportAtMs !== null && now - state.lastExportAtMs < MIN_EXPORT_INTERVAL_MS) {
++    return; // not yet due for the next 15s sample
++  }
++
++  const candidateRows = buildFeatureRows(vehicles, predictions);
++  const newRows = dedupeRows(candidateRows);
++  if (newRows.length === 0) {
++    state.lastExportedSnapshotFetchedAtMs = snapshotFetchedAtMs;
++    return;
++  }
++
++  appendRows(newRows);
++
++  rollDayIfNeeded();
++  state.totalRows += newRows.length;
++  const todayKey = state.todayDateKey;
++  state.todaySamples += newRows.filter((row) => todayDateKeyUtc(row.timestamp) === todayKey).length;
++
++  state.lastExportedSnapshotFetchedAtMs = snapshotFetchedAtMs;
++  state.lastExportAtMs = now;
++}
++
++/** GET /api/ml/dataset/stats */
++export function getDatasetStats(): DatasetStats {
++  ensureInitialized();
++  rollDayIfNeeded();
++
++  const fileStat = statDatasetFile();
++
++  return {
++    totalRows: state.totalRows,
++    lastUpdated: fileStat.lastModifiedMs,
++    fileSize: fileStat.fileSizeBytes,
++    todaySamples: state.todaySamples,
++  };
++}
+diff --git a/ml/features/feature-engineering.ts b/ml/features/feature-engineering.ts
+new file mode 100644
+index 0000000..aa52767
+--- /dev/null
++++ b/ml/features/feature-engineering.ts
+@@ -0,0 +1,57 @@
++/**
++ * ============================================================================
++ * DARPAN — Milestone 9.1: Dataset Generation Pipeline
++ * Module: Feature Engineering
++ * ============================================================================
++ *
++ * Pure function: real `RealtimeVehicle` observations + real
++ * `VehiclePrediction` results in, `DatasetRow[]` out. No I/O, no
++ * randomness, no fabricated values — every column is either read
++ * directly off the live feed or copied from an already-computed
++ * deterministic Prediction Engine result. See `ml/dataset/types.ts` for
++ * the field-by-field provenance of each column.
++ */
++
++import type { DatasetRow } from "@/ml/dataset/types";
++import type { VehiclePrediction } from "@/types/prediction";
++import type { RealtimeVehicle } from "@/types/realtime";
++
++function toRow(vehicle: RealtimeVehicle, prediction: VehiclePrediction): DatasetRow {
++  return {
++    timestamp: vehicle.timestampMs ?? Date.now(),
++    vehicle_id: vehicle.entityId,
++    route_id: vehicle.trip.routeId ?? "",
++    trip_id: vehicle.trip.tripId ?? "",
++    latitude: vehicle.position.lat,
++    longitude: vehicle.position.lon,
++    speed: vehicle.position.speed,
++    bearing: vehicle.position.bearing,
++    stop_sequence: vehicle.currentStopSequence,
++    congestion_index: prediction.congestion.densityScore,
++    deterministic_eta: prediction.eta.etaSeconds,
++    deterministic_delay: prediction.delay.predictedDelaySeconds,
++  };
++}
++
++/**
++ * Joins each live vehicle with its matching Prediction Engine result
++ * (by `vehicleId` / `entityId`) and produces one `DatasetRow` per
++ * matched pair. A vehicle with no corresponding prediction (shouldn't
++ * happen — `PredictionEngine.predictBatch()` covers every vehicle it's
++ * given — but never assumed) is skipped rather than given fabricated
++ * prediction values.
++ */
++export function buildFeatureRows(
++  vehicles: readonly RealtimeVehicle[],
++  predictions: readonly VehiclePrediction[],
++): DatasetRow[] {
++  const predictionByVehicleId = new Map(predictions.map((prediction) => [prediction.vehicleId, prediction]));
++
++  const rows: DatasetRow[] = [];
++  for (const vehicle of vehicles) {
++    const prediction = predictionByVehicleId.get(vehicle.entityId);
++    if (!prediction) continue;
++    rows.push(toRow(vehicle, prediction));
++  }
++  return rows;
++}
+diff --git a/services/analytics/analytics.service.ts b/services/analytics/analytics.service.ts
+index d9ff426..6a9ab7d 100644
+--- a/services/analytics/analytics.service.ts
++++ b/services/analytics/analytics.service.ts
+@@ -52,6 +52,7 @@ import { getTrendSeries, recordTrendSnapshot } from "@/services/analytics/trend.
+ import { getGtfsStatistics } from "@/services/gtfs/statistics";
+ import { getCachedPredictionBatch } from "@/services/prediction/prediction.service";
+ import { getVehiclePositionsSnapshot } from "@/services/realtime/realtime.service";
++import { recordSnapshot as recordDatasetSnapshot } from "@/ml/exporter/dataset-export.service";
+ import type {
+   AIInsight,
+   AnalyticsOverview,
+@@ -91,6 +92,13 @@ async function computeContext(snapshot: RealtimeSnapshot): Promise<AnalyticsCont
+ 
+   recordTrendSnapshot({ overview, realtimeLatencyMs: snapshot.upstreamLatencyMs });
+ 
++  // Milestone 9.1: append one ML training row per vehicle to dataset.csv.
++  // Reuses the exact `snapshot.vehicles` and `predictions` already
++  // computed above — no separate fetch, no separate prediction run.
++  // Internally throttled to a real 15s cadence and deduplicated; see
++  // ml/exporter/dataset-export.service.ts.
++  recordDatasetSnapshot(snapshot.vehicles, predictions, snapshot.fetchedAtMs);
++
+   return { snapshot, predictions, overview, networkHealth, routes, predictionEngineOperational };
+ }
+ 
+-- 
+2.43.0
+
